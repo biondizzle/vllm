@@ -12,6 +12,16 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.platforms import current_platform
+
+# Check at module load time if we're on Blackwell
+_IS_BLACKWELL = False
+try:
+    _cap = current_platform.get_device_capability()
+    if _cap is not None and _cap.major >= 10:
+        _IS_BLACKWELL = True
+except Exception:
+    pass
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -331,6 +341,15 @@ class DeepseekCompressor(nn.Module):
         #   second half sin (per-pair, length rope_head_dim // 2 each)
         # - applied to LAST rope_head_dim elements of head_dim
         # - position used: (positions // compress_ratio) * compress_ratio
+        
+        # On Blackwell (SM100+), skip the fused kernel because:
+        # 1. The fused kernel does attention using FlashMLA which doesn't work on SM100
+        # 2. Our Blackwell attention path handles everything separately
+        # Instead, we just save the state (done above) and let the attention
+        # path handle compression + RoPE + cache write + attention.
+        if _IS_BLACKWELL:
+            return
+
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache

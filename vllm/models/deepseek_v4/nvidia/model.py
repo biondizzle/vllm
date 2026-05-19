@@ -1508,6 +1508,18 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
+    elif expert_dtype == "nvfp4":
+        # NVFP4 (modelopt_fp4) checkpoints use different key naming:
+        # - self_attn prefix instead of attn
+        # - mlp prefix instead of ffn
+        # - Expert weights: gate_proj/up_proj/down_proj (not w1/w3/w2)
+        # - Scales already have .weight_scale / .weight_scale_2 / .input_scale suffixes
+        # - o_a_proj is BF16 (no quantization scales)
+        scale_regex = {
+            re.compile(r"(\.experts\.\d+)\.gate_proj\."): r"\1.w1.",
+            re.compile(r"(\.experts\.\d+)\.up_proj\."): r"\1.w3.",
+            re.compile(r"(\.experts\.\d+)\.down_proj\."): r"\1.w2.",
+        }
     else:
         # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
         # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
@@ -1515,6 +1527,73 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         scale_regex = {
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
+
+    if expert_dtype == "nvfp4":
+        return WeightsMapper(
+            orig_to_new_prefix={
+                "layers.": "model.layers.",
+                "embed.": "model.embed.",
+                "norm.": "model.norm.",
+                "mtp.": "model.mtp.",
+            },
+            orig_to_new_regex=scale_regex,
+            orig_to_new_suffix={
+                ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+            },
+            orig_to_new_substr={
+                # Indexer params (MUST come before general compressor renames)
+                ".self_attn.compressor.indexer.q_b_proj.":
+                    ".attn.indexer.wq_b.",
+                ".self_attn.compressor.indexer.weights_proj.":
+                    ".attn.indexer.weights_proj.",
+                ".self_attn.compressor.indexer.kv_norm.":
+                    ".attn.indexer.k_norm.",
+                ".self_attn.compressor.indexer.kv_proj.":
+                    ".attn.indexer.compressor.wkv.",
+                ".self_attn.compressor.indexer.gate_proj.":
+                    ".attn.indexer.compressor.wgate.",
+                ".self_attn.compressor.indexer.position_bias":
+                    ".attn.indexer.compressor.ape",
+                # Compressor renames (non-indexer)
+                "compressor.kv_proj.": "compressor.wkv.",
+                "compressor.gate_proj.": "compressor.wgate.",
+                "compressor.kv_norm.": "compressor.norm.",
+                "compressor.position_bias": "compressor.ape",
+                ".self_attn.compressor.": ".attn.mla_attn.compressor.",
+                # Attention projections
+                ".self_attn.q_a_proj.": ".attn.wq_a.",
+                ".self_attn.kv_proj.": ".attn.wkv.",
+                ".self_attn.q_b_proj.": ".attn.wq_b.",
+                ".self_attn.o_a_proj.": ".attn.wo_a.",
+                ".self_attn.o_b_proj.": ".attn.wo_b.",
+                ".self_attn.q_a_norm.": ".attn.q_norm.",
+                ".self_attn.kv_norm.": ".attn.kv_norm.",
+                ".self_attn.sinks": ".attn.attn_backend_args.sinks",
+                # Shared experts
+                ".mlp.shared_experts.gate_proj.":
+                    ".ffn.shared_experts.w1.",
+                ".mlp.shared_experts.up_proj.":
+                    ".ffn.shared_experts.w3.",
+                ".mlp.shared_experts.down_proj.":
+                    ".ffn.shared_experts.down_proj.",
+                # General renames
+                ".mlp.": ".ffn.",
+                ".self_attn.": ".attn.",
+                "input_layernorm.": "attn_norm.",
+                "post_attention_layernorm.": "ffn_norm.",
+                # HC params
+                ".attn_hc.fn": ".hc_attn_fn",
+                ".attn_hc.base": ".hc_attn_base",
+                ".attn_hc.scale": ".hc_attn_scale",
+                ".ffn_hc.fn": ".hc_ffn_fn",
+                ".ffn_hc.base": ".hc_ffn_base",
+                ".ffn_hc.scale": ".hc_ffn_scale",
+                "hc_head.hc_fn": "hc_head_fn",
+                "hc_head.hc_base": "hc_head_base",
+                "hc_head.hc_scale": "hc_head_scale",
+            },
+        )
+
     return WeightsMapper(
         orig_to_new_prefix={
             "layers.": "model.layers.",

@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 
-_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+_DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8", "nvfp4")
 
 
 class DeepseekV4FP8Config(Fp8Config):
@@ -24,6 +24,8 @@ class DeepseekV4FP8Config(Fp8Config):
       with ue8m0 (e8m0fnu) FP8 linear scales.
     - ``expert_dtype="fp8"`` (e.g. DeepSeek-V4-Flash-Base): FP8 block
       experts with float32 FP8 linear scales.
+    - ``expert_dtype="nvfp4"`` (e.g. DeepSeek-V4-Pro-NVFP4): NVFP4 experts
+      with CuTeDSL kernels (Blackwell SM100+).
 
     The dispatch and the linear scale dtype are both keyed off
     ``expert_dtype`` from the model's hf_config; missing values default
@@ -68,6 +70,7 @@ class DeepseekV4FP8Config(Fp8Config):
     def is_scale_e8m0(self) -> bool:
         # FP4 checkpoints store FP8 linear scales as e8m0fnu; FP8 expert
         # checkpoints (Flash-Base) store them as float32.
+        # NVFP4 checkpoints use float32 scales.
         return self.expert_dtype == "fp4"
 
     @classmethod
@@ -80,10 +83,16 @@ class DeepseekV4FP8Config(Fp8Config):
     ) -> QuantizationMethods | None:
         if not (
             isinstance(hf_quant_cfg, dict)
-            and hf_quant_cfg.get("quant_method") in ("fp8", "deepseek_v4_fp8")
+            and hf_quant_cfg.get("quant_method") in (
+                "fp8", "deepseek_v4_fp8", "modelopt_fp4",
+            )
         ):
             return None
         model_type = getattr(hf_config, "model_type", None)
+        expert_dtype = getattr(hf_config, "expert_dtype", "fp4") if hf_config else "fp4"
+        # NVFP4 checkpoints use modelopt_fp4 quant method
+        if expert_dtype == "nvfp4" and hf_quant_cfg.get("quant_method") == "modelopt_fp4":
+            return "deepseek_v4_fp8"
         if model_type == "deepseek_v4" or user_quant == "deepseek_v4_fp8":
             return "deepseek_v4_fp8"
         return None
@@ -98,6 +107,9 @@ class DeepseekV4FP8Config(Fp8Config):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
                 return Mxfp4MoEMethod(layer.moe_config)
+            if self.expert_dtype == "nvfp4":
+                from vllm.model_executor.layers.quantization.nvfp4_moe import NvFp4MoEMethod
+                return NvFp4MoEMethod(layer.moe_config)
             # expert_dtype == "fp8": fall through to Fp8Config which
             # returns Fp8MoEMethod with block-wise float32 scales.
         return super().get_quant_method(layer, prefix)

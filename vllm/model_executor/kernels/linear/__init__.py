@@ -92,6 +92,9 @@ from vllm.model_executor.kernels.linear.nvfp4 import (
     NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.nvfp4.cutedsl import (
+    CuTeDSLNvFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
     CutlassNvFp4LinearKernel,
 )
@@ -367,6 +370,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        CuTeDSLNvFp4LinearKernel,
         FlashInferCutlassNvFp4LinearKernel,
         CutlassNvFp4LinearKernel,
         MarlinNvFp4LinearKernel,

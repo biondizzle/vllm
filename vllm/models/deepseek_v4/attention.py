@@ -41,19 +41,14 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_gather)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.input_quant_fp8 import (
-    QuantFP8,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    GroupShape,
-)
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import (
@@ -188,14 +183,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.kv_norm = mla_modules.kv_norm
         self.wo_a = mla_modules.wo_a
 
-        self._wo_a_act_quant = QuantFP8(
-            static=False,
-            group_shape=GroupShape(1, 128),
-            use_ue8m0=True,
-        )
-        # Bypass packed-for-deepgemm path — we need FP32 scales (not packed
-        # INT32) so fp8_einsum can handle layout transform internally.
-        self._wo_a_act_quant.use_deep_gemm_supported = False
         self.wo_b = mla_modules.wo_b
 
         # Pick fp8_einsum recipe based on GPU arch:
@@ -318,7 +305,38 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             return self.wo_b(z.flatten(1))
 
-        # O projection: inverse RoPE + FP8 quant + einsum + wo_b
+        # Detect if wo_a has FP8 weights (weight_scale_inv attribute).
+        # NVFP4 checkpoints leave wo_a as BF16 (no quantization scales),
+        # so we use inverse RoPE in BF16 + regular matmul instead of
+        # the FP8 einsum path (which crashes on Blackwell SM100).
+        has_fp8_weights = hasattr(self.wo_a, 'weight_scale_inv')
+
+        if not has_fp8_weights:
+            # BF16 wo_a path: inverse RoPE in BF16, then per-group BMM
+            o_inv = _apply_inv_rope_bf16(
+                o, positions,
+                self.rotary_emb.cos_sin_cache.to(torch.float32),
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+            )
+            heads_per_group = self.n_local_heads // self.n_local_groups
+            o_inv = o_inv.view(
+                num_tokens, self.n_local_groups, heads_per_group * self.head_dim
+            ).permute(1, 0, 2)
+            wo_a_w = self.wo_a.weight.view(
+                self.n_local_groups, -1, heads_per_group * self.head_dim
+            )
+            z = torch.bmm(
+                o_inv,
+                wo_a_w.transpose(1, 2),
+            )
+            z = z.permute(1, 0, 2)
+            if self.wo_a.gather_output and self.wo_a.tp_size > 1:
+                z = tensor_model_parallel_all_gather(z)
+            z = z.reshape(num_tokens, self.n_local_groups * self.o_lora_rank)
+            return self.wo_b(z)
+
+        # FP8 wo_a path: fused inverse RoPE + FP8 quant + einsum
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
             o,
             positions,
@@ -416,6 +434,15 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         positions: torch.Tensor,
         out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
     ) -> None:
+        # ── Blackwell (SM100+) path ──────────────────────────────────
+        # FlashMLA and fused CUDA kernels don't work on SM100.
+        # Use CSA/SDPA attention with pure PyTorch instead.
+        cap = current_platform.get_device_capability()
+        if cap is not None and cap.major >= 10:
+            self._attention_impl_blackwell(hidden_states, positions, out)
+            return
+
+        # ── Original path (SM90 and below) ───────────────────────────
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
@@ -553,6 +580,211 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             swa_metadata.block_size,
         )
 
+    def _apply_rope_q(self, q, positions):
+        """Apply GPT-J RoPE to Q in-place (fallback when no SWA metadata)."""
+        half = self.rope_head_dim // 2
+        cos_q = self.rotary_emb.cos_sin_cache[positions, :half].unsqueeze(1).to(q.dtype)
+        sin_q = self.rotary_emb.cos_sin_cache[positions, half:].unsqueeze(1).to(q.dtype)
+        q_rope = q[:, :, self.nope_head_dim:].clone()
+        q[:, :, self.nope_head_dim:][:, :, 0::2] = q_rope[:, :, 0::2] * cos_q - q_rope[:, :, 1::2] * sin_q
+        q[:, :, self.nope_head_dim:][:, :, 1::2] = q_rope[:, :, 0::2] * sin_q + q_rope[:, :, 1::2] * cos_q
+
+    def _apply_rope_kv(self, kv, positions):
+        """Apply GPT-J RoPE to KV latent and return the result."""
+        half = self.rope_head_dim // 2
+        cos = self.rotary_emb.cos_sin_cache[positions, :half].to(kv.dtype)
+        sin = self.rotary_emb.cos_sin_cache[positions, half:2*half].to(kv.dtype)
+        kv_rope = kv[:, self.nope_head_dim:].clone()
+        even = kv_rope[:, 0::2]
+        odd = kv_rope[:, 1::2]
+        out = kv.clone()
+        out[:, self.nope_head_dim:][:, 0::2] = even * cos - odd * sin
+        out[:, self.nope_head_dim:][:, 1::2] = even * sin + odd * cos
+        return out
+
+    def _attention_impl_blackwell(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Blackwell (SM100+) attention: KV cache-based, no FlashMLA.
+
+        Uses CSA/SDPA attention with pure PyTorch. Supports SWA, CSA (C4A),
+        and HCA (C128A) attention.
+
+        Pipeline:
+        1. Project Q and KV (same as original)
+        2. Apply RoPE to Q (in-place)
+        3. Write KV to SWA paged cache (RoPE + fp8 quantize + insert)
+        4. Run compressor (Triton, works on Blackwell)
+        5. Run indexer (Triton, works on Blackwell)
+        6. SWA layers: full decode attention with KV cache
+        7. CSA/HCA layers: sparse attention on compressed KV + SWA + sink merge
+        """
+        from vllm.model_executor.layers.csa_attention import (
+            fused_qnorm_rope_kv_insert_py,
+            blackwell_attention_kv_write,
+            blackwell_attention_decode,
+            blackwell_csa_decode_attention,
+            causal_prefill_attention,
+        )
+
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+
+        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+            self.attn_gemm_parallel_execute(hidden_states)
+        )
+        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        qr, kv = fused_q_kv_rmsnorm(
+            qr, kv,
+            self.q_norm.weight.data,
+            self.kv_norm.weight.data,
+            self.eps,
+        )
+
+        # wq_b
+        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+
+        # Run compressor on default stream (Triton-based, works on Blackwell)
+        if self.compressor is not None:
+            self.compressor(kv_score, positions, self.rotary_emb)
+
+        # Run indexer if present
+        if self.indexer is not None:
+            self.indexer(
+                hidden_states, qr, indexer_kv_score, indexer_weights,
+                positions, self.indexer_rotary_emb,
+            )
+
+        # Get metadata
+        if not isinstance(attn_metadata, dict):
+            fused_qnorm_rope_kv_insert_py(
+                q, kv, None, None, positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache, self.eps, 0,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+            )
+            out.zero_()
+            return
+
+        from vllm.v1.attention.backends.mla.sparse_swa import (
+            DeepseekSparseSWAMetadata,
+        )
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        if swa_metadata is None:
+            fused_qnorm_rope_kv_insert_py(
+                q, kv, None, None, positions.to(torch.int64),
+                self.rotary_emb.cos_sin_cache, self.eps, 0,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+            )
+            out.zero_()
+            return
+
+        # Apply per-head RMS norm + RoPE on Q (in-place)
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+        fused_qnorm_rope_kv_insert_py(
+            q, kv, swa_kv_cache_2d,
+            swa_metadata.slot_mapping,
+            positions.to(torch.int64),
+            self.rotary_emb.cos_sin_cache,
+            self.eps,
+            swa_metadata.block_size,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+        )
+
+        # Split prefill and decode
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefills = swa_metadata.num_prefill_tokens
+        swa_only = self.compress_ratio <= 1
+
+        # Write KV to paged cache (RoPE + fp8 quant + insert)
+        if not hasattr(self, '_swa_inv_scale_cache'):
+            max_slots = swa_kv_cache.shape[0] * swa_kv_cache.shape[1]
+            self._swa_inv_scale_cache = torch.zeros(
+                max_slots, 1, dtype=torch.bfloat16, device=kv.device,
+            )
+        blackwell_attention_kv_write(
+            kv, positions, swa_kv_cache, self._swa_inv_scale_cache,
+            swa_metadata.slot_mapping, swa_metadata.block_size,
+            self.rotary_emb.cos_sin_cache,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+        )
+
+        # Get compressed KV cache and indexer metadata for CSA/HCA
+        flashmla_metadata = None
+        if not swa_only:
+            flashmla_metadata = cast(
+                "FlashMLASparseMetadata | None",
+                attn_metadata.get(self.prefix),
+            )
+
+        o = torch.zeros(
+            hidden_states.shape[0], self.n_local_heads, self.head_dim,
+            dtype=torch.bfloat16, device=hidden_states.device,
+        )
+
+        # ── Decode attention ──────────────────────────────────────
+        if num_decode_tokens > 0:
+            if swa_only:
+                q_decode = q[:num_decode_tokens]
+                pos_decode = positions[:num_decode_tokens]
+                for t in range(num_decode_tokens):
+                    o[t] = blackwell_attention_decode(
+                        q_decode[t:t+1], pos_decode[t:t+1],
+                        swa_kv_cache, self._swa_inv_scale_cache,
+                        swa_metadata.slot_mapping[t:t+1],
+                        swa_metadata.block_size,
+                        self.scale,
+                        self.window_size,
+                        swa_indices=swa_metadata.decode_swa_indices,
+                        swa_lens=swa_metadata.decode_swa_lens,
+                        decode_token_idx=t,
+                    ).squeeze(0)
+            else:
+                o[:num_decode_tokens] = blackwell_csa_decode_attention(
+                    q[:num_decode_tokens],
+                    positions[:num_decode_tokens],
+                    swa_kv_cache,
+                    self._swa_inv_scale_cache,
+                    swa_metadata,
+                    flashmla_metadata,
+                    self.mla_attn.kv_cache if not swa_only else None,
+                    self.compress_ratio,
+                    self.scale,
+                    self.window_size,
+                    self.nope_head_dim,
+                    self.rope_head_dim,
+                    self.rotary_emb.cos_sin_cache,
+                    self.mla_attn.attn_sink,
+                    self.mla_attn.max_model_len,
+                )
+
+        # ── Prefill attention ─────────────────────────────────────
+        if num_prefills > 0:
+            q_prefill = q[num_decode_tokens:]
+            kv_rope_prefill = self._apply_rope_kv(
+                kv[num_decode_tokens:], positions[num_decode_tokens:],
+            )
+            o[num_decode_tokens:] = causal_prefill_attention(
+                q_prefill, kv_rope_prefill, self.scale,
+            )
+
+        # Write into the output buffer
+        if self.n_local_heads < self.padded_heads:
+            out[:, :self.n_local_heads, :] = o
+            out[:, self.n_local_heads:, :] = 0
+        else:
+            out.copy_(o)
+
 
 @eager_break_during_capture
 def deepseek_v4_attention(
@@ -613,6 +845,41 @@ direct_register_custom_op(
     mutates_args=["out"],
     fake_impl=deepseek_v4_fp8_einsum_fake,
 )
+
+
+def _apply_inv_rope_bf16(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply inverse RoPE to attention output in BF16.
+
+    Inverse RoPE is just RoPE with sin -> -sin.
+    Uses GPT-J style (interleaved) rotary embedding.
+    """
+    if rope_dim == 0 or o.numel() == 0:
+        return o
+    half_rot = rope_dim // 2
+    o_f32 = o.to(torch.float32)
+    cache = cos_sin_cache.index_select(0, positions.to(torch.long))
+    cos = cache[:, :half_rot].to(torch.float32)
+    sin = cache[:, half_rot : 2 * half_rot].to(torch.float32)
+    view_shape = (positions.shape[0], 1, half_rot)
+    cos = cos.view(view_shape)
+    sin = sin.view(view_shape)
+    rope = o_f32[..., nope_dim:]
+    y_even = rope[..., 0::2]
+    y_odd = rope[..., 1::2]
+    # Inverse: sin → -sin (swap signs on cross terms)
+    rope_out = torch.stack(
+        (y_even * cos + y_odd * sin, y_odd * cos - y_even * sin),
+        dim=-1,
+    ).flatten(-2)
+    o_f32 = o_f32.clone()
+    o_f32[..., nope_dim:] = rope_out
+    return o_f32.to(o.dtype)
 
 
 class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
@@ -696,12 +963,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             f"DeepseekV4 only supports fp8 kv-cache format for now, "
             f"got {kv_cache_dtype}"
         )
-        assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
-            "Only FlashMLA Sparse Attention backend is supported for DeepseekV4 for now"
+        # On Blackwell (SM100+), FlashMLA kernels don't work.
+        # We use our own CSA/SDPA attention path.
+        _is_blackwell = (
+            current_platform.get_device_capability() is not None
+            and current_platform.get_device_capability().major >= 10
         )
+        if not _is_blackwell:
+            assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
+                "Only FlashMLA Sparse Attention backend is supported for DeepseekV4 for now"
+            )
         # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
         # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
-        if (
+        # On Blackwell, we use our own attention path, so keep standard fp8
+        if not _is_blackwell and (
             issubclass(self.get_attn_backend(), FlashMLASparseBackend)
             and kv_cache_dtype.startswith("fp8")
             and kv_cache_dtype != "fp8_ds_mla"
@@ -723,6 +998,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        cap = current_platform.get_device_capability()
+        if cap is not None and cap.major >= 10:
+            # Blackwell: FlashMLA doesn't work. Use our CSA/SDPA path.
+            from vllm.v1.attention.backends.mla.sparse_swa import (
+                DeepseekSparseSWABackend,
+            )
+            return DeepseekSparseSWABackend
         if current_platform.is_rocm():
             from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse_dsv4 import (
                 DeepseekV4ROCMAiterMLASparseBackend,
@@ -736,6 +1018,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             self.compress_ratio <= 1
         ):  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
+        cap = current_platform.get_device_capability()
+        _is_blackwell = cap is not None and cap.major >= 10
+        if _is_blackwell:
+            # Blackwell: no FlashMLA, use standard fp8_e4m3 KV cache
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=torch.uint8,
+                compress_ratio=self.compress_ratio,
+                cache_dtype_str=self.kv_cache_dtype,  # "fp8" (not fp8_ds_mla)
+                alignment=None,
+                model_version="deepseek_v4",
+            )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
