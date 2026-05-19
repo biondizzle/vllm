@@ -234,3 +234,35 @@ direct_register_custom_op(
     op_func=_hc_head_fused_kernel_impl,
     mutates_args=["out"],
 )
+
+
+@CustomOp.register("hc_head")
+class HCHeadOp(CustomOp):
+    """HC head operation — reduces multi-head residual to single hidden state."""
+
+    @classmethod
+    def enabled(cls) -> bool:
+        return True
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_eps: float,
+    ) -> torch.Tensor:
+        # hidden_states: (num_tokens, hc_mult, hidden_size)
+        hc_mult = hidden_states.shape[-2]
+        hidden_size = hidden_states.shape[-1]
+        x = hidden_states.reshape(hidden_states.shape[0], hc_mult * hidden_size).to(torch.float32)
+        mixes = torch.matmul(x, fn.t())
+        sqrsum = x.square().sum(dim=-1, keepdim=True)
+        rsqrt = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+        pre_mix = torch.sigmoid(mixes * rsqrt * hc_scale[0] + hc_base) + hc_eps
+        result = torch.sum(pre_mix.unsqueeze(-1) * hidden_states.to(torch.float32), dim=1).to(hidden_states.dtype)
+        return result
+
+    def forward_native(self, *args, **kwargs):
+        return self.forward_cuda(*args, **kwargs)

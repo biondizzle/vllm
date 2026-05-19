@@ -1456,7 +1456,10 @@ class DeepseekV4Model(nn.Module):
                         if success:
                             name = name_mapped
                             break
-                    loaded_params.add(name_mapped)
+                    # name was updated to name_mapped on success; if no mapping
+                    # matched, skip this weight
+                    if any(weight_name in name for _, weight_name, _, _ in expert_mapping):
+                        loaded_params.add(name)
                     continue
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
@@ -1604,7 +1607,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         },
         orig_to_new_regex=scale_regex,
         orig_to_new_suffix={
-            "head.weight": "lm_head.weight",
+            # "head.weight": "lm_head.weight",  # REMOVED: checkpoint already uses lm_head.weight
             "embed.weight": "embed_tokens.weight",
             # Pre-MoE norm + gate are now owned by ``DeepseekV4MoE.norm_gate``
             # (see NormGatedLinear).
