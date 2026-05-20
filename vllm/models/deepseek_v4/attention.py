@@ -322,8 +322,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             # Use CuTeDSL NVFP4 kernel if available (wo_a has a runner)
             if hasattr(self.wo_a, '_cutedsl_runner_id'):
                 from cutedsl.custom_ops import nvfp4_linear_gemm
+                # o_inv is [num_tokens, n_local_heads, head_dim] (3D);
+                # flatten to 2D for the CuTeDSL kernel, then reshape back
+                o_inv_2d = o_inv.reshape(num_tokens, -1)
                 z = nvfp4_linear_gemm(
-                    o_inv, self.wo_a._cutedsl_runner_id,
+                    o_inv_2d, self.wo_a._cutedsl_runner_id,
                     self.wo_a._cutedsl_out_features,
                 )
                 if self.wo_a.gather_output and self.wo_a.tp_size > 1:
