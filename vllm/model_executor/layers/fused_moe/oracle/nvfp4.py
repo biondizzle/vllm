@@ -43,6 +43,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
+    CUTEDSL = "CUTEDSL"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
     EMULATION = "EMULATION"
@@ -53,6 +54,10 @@ FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_CUTLASS,
     NvFp4MoeBackend.FLASHINFER_CUTEDSL,
     NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
+]
+
+CUTEDSL_NVFP4_MOE_BACKENDS = [
+    NvFp4MoeBackend.CUTEDSL,
 ]
 
 fi_2_vllm_backend_map: dict[FlashinferMoeBackend, NvFp4MoeBackend] = {
@@ -67,7 +72,7 @@ def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
     # of all experts in Expert Parallel Mode when all experts are not
     # on the same rank.
 
-    return backend in FLASHINFER_NVFP4_MOE_BACKENDS
+    return backend in FLASHINFER_NVFP4_MOE_BACKENDS or backend in CUTEDSL_NVFP4_MOE_BACKENDS
 
 
 def backend_to_kernel_cls(
@@ -106,6 +111,13 @@ def backend_to_kernel_cls(
 
         return [FlashInferCuteDSLBatchedExperts]
 
+    elif backend == NvFp4MoeBackend.CUTEDSL:
+        from vllm.model_executor.layers.fused_moe.experts.cutedsl_moe import (  # noqa: E501
+            CuTeDSLMoEExperts,
+        )
+
+        return [CuTeDSLMoEExperts]
+
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassExpertsFp4,
@@ -136,6 +148,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_trtllm": NvFp4MoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        "cutedsl": NvFp4MoeBackend.CUTEDSL,
         "marlin": NvFp4MoeBackend.MARLIN,
         "emulation": NvFp4MoeBackend.EMULATION,
     }
@@ -162,6 +175,7 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
+        NvFp4MoeBackend.CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.MARLIN,
@@ -329,6 +343,14 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale_2=w2_scale_2,
             a2_scale=a2_scale,
         )
+    elif nvfp4_backend == NvFp4MoeBackend.CUTEDSL:
+        # CuTeDSL kernel handles weight conversion in its own
+        # process_weights_after_loading. Pass through raw weights.
+        # Compute inverse activation scales for the quant config.
+        if a13_scale is not None:
+            a13_scale = 1.0 / a13_scale
+        if a2_scale is not None:
+            a2_scale = 1.0 / a2_scale
     elif (
         nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
         or nvfp4_backend == NvFp4MoeBackend.VLLM_CUTLASS
@@ -463,6 +485,7 @@ def make_nvfp4_moe_quant_config(
             not in (
                 NvFp4MoeBackend.FLASHINFER_TRTLLM,
                 NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+                NvFp4MoeBackend.CUTEDSL,
             )
         ),
     )

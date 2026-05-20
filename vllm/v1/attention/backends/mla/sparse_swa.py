@@ -76,6 +76,9 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         assert self.dtype == torch.uint8
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        from vllm.platforms import current_platform
+        cap = current_platform.get_device_capability()
+        _is_blackwell = cap is not None and cap.major >= 10
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -83,7 +86,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            alignment=576,  # NOTE: FlashMLA requires 576B alignment
+            alignment=None if _is_blackwell else 576,
             model_version="deepseek_v4",
         )
 
@@ -183,6 +186,17 @@ class DeepseekSparseSWAMetadata:
     tile_sched_c4a: "FlashMLASchedMeta | None" = None
     tile_sched_c128a: "FlashMLASchedMeta | None" = None
 
+    # C128A sparse attention metadata (Blackwell path).
+    # Computed by our build_c128a_topk_metadata CUDA kernel.
+    # For Hopper, these are in FlashMLASparseMetadata instead.
+    c128a_global_decode_topk_indices: torch.Tensor | None = None  # [num_decode_tokens, max_compressed]
+    c128a_decode_topk_lens: torch.Tensor | None = None  # [num_decode_tokens]
+
+    # C128A buffers (passed through to attention.py for kernel invocation)
+    c128a_global_decode_buffer: torch.Tensor | None = None  # [max_tokens, max_compressed]
+    c128a_decode_lens_buffer: torch.Tensor | None = None  # [max_tokens]
+    c128a_prefill_buffer: torch.Tensor | None = None  # [max_tokens, max_compressed]
+
 
 class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     """Builds metadata for DeepseekV4 SWA cache.
@@ -256,6 +270,20 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             max_tokens,
             dtype=torch.bool,
             device=self.device,
+        )
+
+        # C128A topk metadata buffers. max_compressed = max_seq_len // 128.
+        # With max_seq_len typically 8192 and cr=128, max_compressed = 64.
+        # Use 8192 as safe upper bound for long sequences (1M tokens → 8192 compressed).
+        self._c128a_max_compressed = 8192
+        self.c128a_global_decode_buffer = torch.full(
+            (max_tokens, self._c128a_max_compressed), -1, dtype=torch.int32, device=self.device,
+        )
+        self.c128a_decode_lens_buffer = torch.zeros(
+            max_tokens, dtype=torch.int32, device=self.device,
+        )
+        self.c128a_prefill_buffer = torch.full(
+            (max_tokens, self._c128a_max_compressed), -1, dtype=torch.int32, device=self.device,
         )
 
     def build(
@@ -345,6 +373,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
             tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
             tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
+            c128a_global_decode_buffer=self.c128a_global_decode_buffer,
+            c128a_decode_lens_buffer=self.c128a_decode_lens_buffer,
+            c128a_prefill_buffer=self.c128a_prefill_buffer,
             **deepseek_v4_fields,
         )
 

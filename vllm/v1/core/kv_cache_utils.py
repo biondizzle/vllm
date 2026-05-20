@@ -1546,7 +1546,11 @@ def _get_kv_cache_groups_uniform_groups(
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
-        assert max(sm_page_sizes) <= max(all_page_sizes)
+        if max(sm_page_sizes) > max(all_page_sizes):
+            # On Blackwell, SWA pages may be larger than compressed pages
+            # due to different compress_ratios. Skip padding in this case
+            # and use the SWA page sizes directly.
+            all_page_sizes = sorted(set(all_page_sizes) | set(sm_page_sizes))
 
         # Unify page size by padding layers' page_size to the nearest larger page_size.
         # Compute candidate (nearest larger page_size) for each unique page size.
