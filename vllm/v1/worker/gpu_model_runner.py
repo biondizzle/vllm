@@ -7240,6 +7240,7 @@ class GPUModelRunner(
                 )
                 encoder_only_attn_specs[attn_spec].append(layer_name)
                 self.runner_only_attn_layers.add(layer_name)
+
         if len(encoder_only_attn_specs) > 0:
             assert len(encoder_only_attn_specs) == 1, (
                 "Only support one encoder-only attention spec now"

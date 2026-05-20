@@ -165,13 +165,18 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Invalid compress ratio: {compress_ratio}")
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        from vllm.platforms import current_platform
+        cap = current_platform.get_device_capability()
+        _is_blackwell = cap is not None and cap.major >= 10
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            alignment=576,  # NOTE: FlashMLA requires 576B alignment
+            alignment=None if _is_blackwell else 576,
+            model_version="deepseek_v4" if _is_blackwell else None,
+            cache_dtype_str="fp8_e4m3" if _is_blackwell else None,
         )
 
     def forward(self): ...
