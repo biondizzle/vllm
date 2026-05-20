@@ -735,28 +735,28 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # ── Decode attention ──────────────────────────────────────
         if num_decode_tokens > 0:
             if swa_only:
-                # Batched SWA decode — NO Python for-loop
-                from vllm.model_executor.layers.csa_attention import blackwell_batched_swa_decode
-                o[:num_decode_tokens] = blackwell_batched_swa_decode(
+                # Native SWA decode — CuTeDSL kernel with batched SDPA fallback
+                from cutedsl.native_swa_decode import native_swa_decode_attention
+                o[:num_decode_tokens] = native_swa_decode_attention(
                     q[:num_decode_tokens],
-                    positions[:num_decode_tokens],
                     swa_kv_cache,
                     self._swa_inv_scale_cache,
-                    swa_metadata,
+                    swa_metadata.decode_swa_indices[:num_decode_tokens],
+                    swa_metadata.decode_swa_lens[:num_decode_tokens],
                     swa_metadata.block_size,
                     self.scale,
                     self.window_size,
                 )
             else:
-                # CSA/HCA decode: use batched SWA decode for the SWA component
-                # TODO: add sparse attention on compressed KV and merge with sink weights
-                from vllm.model_executor.layers.csa_attention import blackwell_batched_swa_decode
-                o[:num_decode_tokens] = blackwell_batched_swa_decode(
+                # CSA/HCA decode: native SWA decode for SWA component
+                # TODO: add CuTeDSA sparse attention on compressed KV + merge with sink weights
+                from cutedsl.native_swa_decode import native_swa_decode_attention
+                o[:num_decode_tokens] = native_swa_decode_attention(
                     q[:num_decode_tokens],
-                    positions[:num_decode_tokens],
                     swa_kv_cache,
                     self._swa_inv_scale_cache,
-                    swa_metadata,
+                    swa_metadata.decode_swa_indices[:num_decode_tokens],
+                    swa_metadata.decode_swa_lens[:num_decode_tokens],
                     swa_metadata.block_size,
                     self.scale,
                     self.window_size,
