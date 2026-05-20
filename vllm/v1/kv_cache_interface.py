@@ -517,8 +517,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             if self.cache_dtype_str == "fp8_ds_mla":
                 # FlashMLA format: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 return self.storage_block_size * 584
-            # Standard fp8_e4m3 format (Blackwell): use head_size bytes per token.
-            return self.storage_block_size * self.head_size
+            # Standard fp8_e4m3 format (Blackwell): head_size * dtype_size per token.
+            return (
+                self.storage_block_size
+                * self.num_kv_heads
+                * self.head_size
+                * get_dtype_size(self.dtype)
+            )
         assert self.model_version is None, (
             f"Unsupported model version: {self.model_version}"
         )
