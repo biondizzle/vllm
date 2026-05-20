@@ -102,7 +102,7 @@ class CuTeDSLNvFp4LinearKernel(NvFp4LinearKernel):
         # Replace weight with a GPU dummy (some vLLM code paths like
         # torch.mm(compressor.weight.T) expect weight on GPU).
         layer.weight = torch.nn.Parameter(
-            torch.zeros(out_features, in_features, dtype=torch.bfloat16,
+            torch.zeros(1, 1, dtype=torch.bfloat16,
                         device=device),
             requires_grad=False,
         )
