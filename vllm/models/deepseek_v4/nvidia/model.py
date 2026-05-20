@@ -891,7 +891,7 @@ class DeepseekV4Attention(nn.Module):
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             return_bias=False,
             prefix=f"{prefix}.wo_a",
         )
