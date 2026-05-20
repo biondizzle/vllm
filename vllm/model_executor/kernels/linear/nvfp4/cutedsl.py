@@ -39,6 +39,10 @@ class CuTeDSLNvFp4LinearKernel(NvFp4LinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert NVFP4 weights into CuTeDSL kernel format."""
+        # Skip BF16 layers that are not actually NVFP4 quantized
+        if layer.weight.dtype != torch.uint8:
+            return
+
         from cutedsl.nvfp4_linear import CuTeDSLNvfp4Linear
 
         w_uint8 = layer.weight.data

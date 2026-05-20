@@ -1191,6 +1191,10 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Skip BF16 layers that are not actually NVFP4 quantized
+        if layer.weight.dtype != torch.uint8:
+            return
+
         if (
             torch.unique(layer.input_scale).numel() != 1
             or torch.unique(layer.weight_scale_2).numel() != 1
