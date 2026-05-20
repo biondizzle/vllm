@@ -735,37 +735,31 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # ── Decode attention ──────────────────────────────────────
         if num_decode_tokens > 0:
             if swa_only:
-                q_decode = q[:num_decode_tokens]
-                pos_decode = positions[:num_decode_tokens]
-                for t in range(num_decode_tokens):
-                    o[t] = blackwell_attention_decode(
-                        q_decode[t:t+1], pos_decode[t:t+1],
-                        swa_kv_cache, self._swa_inv_scale_cache,
-                        swa_metadata.slot_mapping[t:t+1],
-                        swa_metadata.block_size,
-                        self.scale,
-                        self.window_size,
-                        swa_indices=swa_metadata.decode_swa_indices,
-                        swa_lens=swa_metadata.decode_swa_lens,
-                        decode_token_idx=t,
-                    ).squeeze(0)
-            else:
-                o[:num_decode_tokens] = blackwell_csa_decode_attention(
+                # Batched SWA decode — NO Python for-loop
+                from vllm.model_executor.layers.csa_attention import blackwell_batched_swa_decode
+                o[:num_decode_tokens] = blackwell_batched_swa_decode(
                     q[:num_decode_tokens],
                     positions[:num_decode_tokens],
                     swa_kv_cache,
                     self._swa_inv_scale_cache,
                     swa_metadata,
-                    flashmla_metadata,
-                    self.mla_attn.kv_cache if not swa_only else None,
-                    self.compress_ratio,
+                    swa_metadata.block_size,
                     self.scale,
                     self.window_size,
-                    self.nope_head_dim,
-                    self.rope_head_dim,
-                    self.rotary_emb.cos_sin_cache,
-                    self.mla_attn.attn_sink,
-                    self.mla_attn.max_model_len,
+                )
+            else:
+                # CSA/HCA decode: use batched SWA decode for the SWA component
+                # TODO: add sparse attention on compressed KV and merge with sink weights
+                from vllm.model_executor.layers.csa_attention import blackwell_batched_swa_decode
+                o[:num_decode_tokens] = blackwell_batched_swa_decode(
+                    q[:num_decode_tokens],
+                    positions[:num_decode_tokens],
+                    swa_kv_cache,
+                    self._swa_inv_scale_cache,
+                    swa_metadata,
+                    swa_metadata.block_size,
+                    self.scale,
+                    self.window_size,
                 )
 
         # ── Prefill attention ─────────────────────────────────────
