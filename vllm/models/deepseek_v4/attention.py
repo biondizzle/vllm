@@ -721,11 +721,18 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # Get compressed KV cache and indexer metadata for CSA/HCA
         flashmla_metadata = None
+        indexer_metadata = None
         if not swa_only:
-            flashmla_metadata = cast(
-                "FlashMLASparseMetadata | None",
-                attn_metadata.get(self.prefix),
-            )
+            raw_meta = attn_metadata.get(self.prefix)
+            if raw_meta is not None and hasattr(raw_meta, "block_size"):
+                # Hopper: FlashMLASparseMetadata
+                flashmla_metadata = cast("FlashMLASparseMetadata | None", raw_meta)
+            elif raw_meta is not None and hasattr(raw_meta, "decode"):
+                # Blackwell: DeepseekV32IndexerMetadata
+                indexer_metadata = raw_meta
+            else:
+                # Fallback: try as FlashMLASparseMetadata
+                flashmla_metadata = cast("FlashMLASparseMetadata | None", raw_meta)
 
         o = torch.zeros(
             hidden_states.shape[0], self.n_local_heads, self.head_dim,
@@ -748,19 +755,110 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     self.window_size,
                 )
             else:
-                # CSA/HCA decode: native SWA decode for SWA component
-                # TODO: add CuTeDSA sparse attention on compressed KV + merge with sink weights
-                from cutedsl.native_swa_decode import native_swa_decode_attention
-                o[:num_decode_tokens] = native_swa_decode_attention(
-                    q[:num_decode_tokens],
-                    swa_kv_cache,
-                    self._swa_inv_scale_cache,
-                    swa_metadata.decode_swa_indices[:num_decode_tokens],
-                    swa_metadata.decode_swa_lens[:num_decode_tokens],
-                    swa_metadata.block_size,
-                    self.scale,
-                    self.window_size,
-                )
+                # CSA/HCA decode: native sparse + SWA decode with sink weight merge
+                from cutedsl.native_sparse_decode import native_sparse_decode_attention
+
+                # Get compressed KV cache and topk indices
+                assert flashmla_metadata is not None or indexer_metadata is not None,                     f"No metadata for sparse attention (prefix={self.prefix}, cr={self.compress_ratio})"
+                assert swa_metadata.is_valid_token is not None
+                is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
+                compressed_kv_cache = self.mla_attn.kv_cache
+
+                # Compute topk indices for sparse attention
+                topk_indices = None
+                topk_lens = None
+
+                if flashmla_metadata is not None:
+                    # Hopper path: use FlashMLASparseMetadata block_table
+                    block_size = flashmla_metadata.block_size // self.compress_ratio
+                    if self.compress_ratio == 4:
+                        assert self.mla_attn.topk_indices_buffer is not None
+                        from vllm.models.deepseek_v4.common.ops import (
+                            compute_global_topk_indices_and_lens,
+                        )
+                        global_indices, topk_lens = compute_global_topk_indices_and_lens(
+                            self.mla_attn.topk_indices_buffer[:num_decode_tokens],
+                            swa_metadata.token_to_req_indices,
+                            flashmla_metadata.block_table[:swa_metadata.num_decodes],
+                            block_size,
+                            is_valid,
+                        )
+                        topk_indices = global_indices.view(num_decode_tokens, 1, -1)
+                    else:
+                        topk_indices = getattr(flashmla_metadata, "c128a_global_decode_topk_indices", None)
+                        topk_lens = getattr(flashmla_metadata, "c128a_decode_topk_lens", None)
+                elif indexer_metadata is not None:
+                    # Blackwell path: use our sparse_topk_metadata kernels
+                    from cutedsl.sparse_topk_metadata import (
+                        build_c128a_topk_metadata,
+                        compute_c4a_global_topk,
+                    )
+                    indexer_block_table = indexer_metadata.decode.block_table[:swa_metadata.num_decodes]
+                    indexer_block_size = 256  # DeepseekV4IndexerBackend block_size
+                    if self.compress_ratio == 4:
+                        # C4A: local topk indices → global slot IDs
+                        assert self.mla_attn.topk_indices_buffer is not None
+                        global_indices, topk_lens = compute_c4a_global_topk(
+                            self.mla_attn.topk_indices_buffer[:num_decode_tokens],
+                            swa_metadata.token_to_req_indices[:num_decode_tokens],
+                            indexer_block_table,
+                            indexer_block_size // self.compress_ratio,
+                            is_valid,
+                        )
+                        topk_indices = global_indices.view(num_decode_tokens, 1, -1)
+                    elif self.compress_ratio == 128:
+                        # C128A: position-based compressed KV slot lookup
+                        topk_indices, topk_lens, _ = build_c128a_topk_metadata(
+                            positions[:num_decode_tokens],
+                            self.compress_ratio,
+                            num_decode_tokens,
+                            swa_metadata.token_to_req_indices[:num_decode_tokens],
+                            indexer_block_table,
+                            indexer_block_size // self.compress_ratio,
+                            swa_metadata.slot_mapping[:num_decode_tokens],
+                            swa_metadata.c128a_global_decode_buffer[:num_decode_tokens],
+                            swa_metadata.c128a_decode_lens_buffer[:num_decode_tokens],
+                            swa_metadata.c128a_prefill_buffer,
+                        )
+                        topk_indices = topk_indices.view(num_decode_tokens, 1, -1)
+
+                # Per-head inverse scale for compressed KV cache
+                if not hasattr(self, '_comp_inv_scale_cache'):
+                    max_comp_slots = compressed_kv_cache.shape[0] * compressed_kv_cache.shape[1]
+                    self._comp_inv_scale_cache = torch.ones(
+                        max_comp_slots, 1, dtype=torch.bfloat16, device=compressed_kv_cache.device,
+                    )
+
+                if topk_indices is None:
+                    # No sparse indices (e.g. sparse SWA backend) — SWA-only decode
+                    from cutedsl.native_swa_decode import native_swa_decode_attention
+                    o[:num_decode_tokens] = native_swa_decode_attention(
+                        q[:num_decode_tokens],
+                        swa_kv_cache,
+                        self._swa_inv_scale_cache,
+                        swa_metadata.decode_swa_indices[:num_decode_tokens],
+                        swa_metadata.decode_swa_lens[:num_decode_tokens],
+                        swa_metadata.block_size,
+                        self.scale,
+                        self.window_size,
+                    )
+                else:
+                    o[:num_decode_tokens] = native_sparse_decode_attention(
+                        q[:num_decode_tokens],
+                        swa_kv_cache,
+                        self._swa_inv_scale_cache,
+                        swa_metadata.decode_swa_indices[:num_decode_tokens],
+                        swa_metadata.decode_swa_lens[:num_decode_tokens],
+                        compressed_kv_cache,
+                        self._comp_inv_scale_cache,
+                        topk_indices,
+                        topk_lens,
+                        self.attn_sink,  # (padded_heads,) float32 sink weights
+                        swa_metadata.block_size,
+                        self.scale,
+                        self.window_size,
+                        compress_ratio=self.compress_ratio,
+                    )
 
         # ── Prefill attention ─────────────────────────────────────
         if num_prefills > 0:
@@ -1135,8 +1233,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
                 # C128A: pre-computed during metadata build.
-                topk_indices = attn_metadata.c128a_global_decode_topk_indices
-                topk_lens = attn_metadata.c128a_decode_topk_lens
+                topk_indices = getattr(attn_metadata, "c128a_global_decode_topk_indices", None)
+                topk_lens = getattr(attn_metadata, "c128a_decode_topk_lens", None)
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
