@@ -321,11 +321,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             # Use CuTeDSL NVFP4 kernel if available (wo_a has a runner)
             if hasattr(self.wo_a, '_cutedsl_runner_id'):
-                # o_inv is [num_tokens, n_local_heads, head_dim] (3D);
-                # flatten to 2D and route through wo_a.forward() which
-                # handles TP properly for ColumnParallelLinear
+                from cutedsl.custom_ops import nvfp4_linear_gemm
+                # o_inv is [num_tokens, n_local_heads, head_dim] (3D).
+                # wo_a input is [num_tokens, n_heads * head_dim // n_groups]
+                # which is the full (unsplit) attention output. With TP,
+                # each rank has n_local_heads heads, so we must all-gather
+                # the attention output before feeding to wo_a.
                 o_inv_2d = o_inv.reshape(num_tokens, -1)
-                z, _ = self.wo_a(o_inv_2d)
+                if self.wo_a.tp_size > 1:
+                    o_inv_2d = tensor_model_parallel_all_gather(o_inv_2d)
+                z = nvfp4_linear_gemm(
+                    o_inv_2d, self.wo_a._cutedsl_runner_id,
+                    self.wo_a._cutedsl_out_features,
+                )
                 z = z.reshape(num_tokens, self.n_local_groups * self.o_lora_rank)
                 return self.wo_b(z)
             heads_per_group = self.n_local_heads // self.n_local_groups
