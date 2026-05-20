@@ -319,6 +319,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 nope_dim=self.nope_head_dim,
                 rope_dim=self.rope_head_dim,
             )
+            # Use CuTeDSL NVFP4 kernel if available (wo_a has a runner)
+            if hasattr(self.wo_a, '_cutedsl_runner_id'):
+                from cutedsl.custom_ops import nvfp4_linear_gemm
+                z = nvfp4_linear_gemm(
+                    o_inv, self.wo_a._cutedsl_runner_id,
+                    self.wo_a._cutedsl_out_features,
+                )
+                if self.wo_a.gather_output and self.wo_a.tp_size > 1:
+                    z = tensor_model_parallel_all_gather(z)
+                z = z.reshape(num_tokens, self.n_local_groups * self.o_lora_rank)
+                return self.wo_b(z)
             heads_per_group = self.n_local_heads // self.n_local_groups
             o_inv = o_inv.view(
                 num_tokens, self.n_local_groups, heads_per_group * self.head_dim
@@ -332,7 +343,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
             z = z.permute(1, 0, 2)
             if self.wo_a.gather_output and self.wo_a.tp_size > 1:
-                z = tensor_model_parallel_all_gather(z)
+                z = tensor_model_all_gather(z)
             z = z.reshape(num_tokens, self.n_local_groups * self.o_lora_rank)
             return self.wo_b(z)
 
